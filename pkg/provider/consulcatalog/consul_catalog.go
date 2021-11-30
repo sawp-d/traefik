@@ -55,6 +55,7 @@ type Provider struct {
 	ConnectAware      bool            `description:"Enable Consul Connect support." json:"connectAware,omitempty" toml:"connectAware,omitempty" yaml:"connectAware,omitempty" export:"true"`
 	ConnectByDefault  bool            `description:"Consider every service as Connect capable by default." json:"connectByDefault,omitempty" toml:"connectByDefault,omitempty" yaml:"connectByDefault,omitempty" export:"true"`
 	ServiceName       string          `description:"Name of the Traefik service in Consul Catalog (needs to be registered via the orchestrator or manually)." json:"serviceName,omitempty" toml:"serviceName,omitempty" yaml:"serviceName,omitempty" export:"true"`
+	Namespaces        []string        `description:"Namespaces to search.  Use ['*'] to search across all namespaces.  If missing, only the default namespace is searched." json:"namespaces,omitempty" toml:"namespaces,omitempty" yaml:"namespaces,omitempty"`
 
 	client         *api.Client
 	defaultRuleTpl *template.Template
@@ -240,14 +241,33 @@ func (p *Provider) getConsulServicesData(ctx context.Context) ([]itemData, error
 		}
 
 		consulServices, statuses, err := p.fetchService(ctx, name, svcCfg.ConsulCatalog.Connect)
+	// if no namespaces are specified, only use the default
+	if len(p.Namespaces) == 0 {
+		p.Namespaces = []string{"default"}
+	}
+
+	// if namespace list is ["*"], search all namespaces
+	if len(p.Namespaces) == 1 && p.Namespaces[0] == "*" {
+		allNamespaces, err := p.fetchNamespaces(ctx)
+		if err != nil {
+			return nil, err
+		}
+		p.Namespaces = allNamespaces
+	}
+
+	var data []itemData
+	for _, ns := range p.Namespaces {
+		nsLogger := log.FromContext(log.With(ctx, log.Str("namespace", ns)))
+		nsLogger.Debug("Checking namespace for services")
+		consulServiceNames, err := p.fetchServices(ctx, ns)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, consulService := range consulServices {
-			address := consulService.ServiceAddress
-			if address == "" {
-				address = consulService.Address
+		for _, name := range consulServiceNames {
+			consulServices, statuses, err := p.fetchService(ctx, name, ns)
+			if err != nil {
+				return nil, err
 			}
 
 			namespace := consulService.Namespace
@@ -279,21 +299,65 @@ func (p *Provider) getConsulServicesData(ctx context.Context) ([]itemData, error
 				continue
 			}
 			item.ExtraConf = extraConf
+			for _, consulService := range consulServices {
+				address := consulService.ServiceAddress
+				if address == "" {
+					address = consulService.Address
+				}
 
-			data = append(data, item)
+				status, exists := statuses[consulService.ID+consulService.ServiceID]
+				if !exists {
+					status = api.HealthAny
+				}
+
+				item := itemData{
+					ID:        consulService.ServiceID,
+					Node:      consulService.Node,
+					Name:      consulService.ServiceName,
+					Namespace: consulService.Namespace,
+					Address:   address,
+					Port:      strconv.Itoa(consulService.ServicePort),
+					Labels:    tagsToNeutralLabels(consulService.ServiceTags, p.Prefix),
+					Tags:      consulService.ServiceTags,
+					Status:    status,
+				}
+
+				extraConf, err := p.getConfiguration(item)
+				if err != nil {
+					log.FromContext(ctx).Errorf("Skip item %s: %v", item.Name, err)
+					continue
+				}
+				item.ExtraConf = extraConf
+
+				data = append(data, item)
+			}
 		}
 	}
 
 	return data, nil
 }
 
-func (p *Provider) fetchService(ctx context.Context, name string, connectEnabled bool) ([]*api.CatalogService, map[string]string, error) {
+func (p *Provider) fetchNamespaces(ctx context.Context) ([]string, error) {
+	namespaces := []string{}
+	consulNamespaces, _, err := p.client.Namespaces().List(nil)
+	if err != nil {
+		return []string{}, err
+	}
+	for _, ns := range consulNamespaces {
+		if ns.DeletedAt == nil {
+			namespaces = append(namespaces, ns.Name)
+		}
+	}
+	return namespaces, nil
+}
+
+func (p *Provider) fetchService(ctx context.Context, name string, namespace string) ([]*api.CatalogService, map[string]string, error) {
 	var tagFilter string
 	if !p.ExposedByDefault {
 		tagFilter = p.Prefix + ".enable=true"
 	}
 
-	opts := &api.QueryOptions{AllowStale: p.Stale, RequireConsistent: p.RequireConsistent, UseCache: p.Cache}
+	opts := &api.QueryOptions{AllowStale: p.Stale, RequireConsistent: p.RequireConsistent, UseCache: p.Cache, Namespace: namespace}
 	opts = opts.WithContext(ctx)
 
 	catalogFunc := p.client.Catalog().Service
@@ -333,6 +397,14 @@ func rootsWatchHandler(ctx context.Context, dest chan<- []string) func(watch.Blo
 			log.FromContext(ctx).Errorf("Root certificate watcher called with nil")
 			return
 		}
+func (p *Provider) fetchServices(ctx context.Context, namespace string) ([]string, error) {
+	// The query option "Filter" is not supported by /catalog/services.
+	// https://www.consul.io/api/catalog.html#list-services
+	opts := &api.QueryOptions{AllowStale: p.Stale, RequireConsistent: p.RequireConsistent, UseCache: p.Cache, Namespace: namespace}
+	serviceNames, _, err := p.client.Catalog().Services(opts)
+	if err != nil {
+		return nil, err
+	}
 
 		v, ok := raw.(*api.CARootList)
 		if !ok || v == nil {
